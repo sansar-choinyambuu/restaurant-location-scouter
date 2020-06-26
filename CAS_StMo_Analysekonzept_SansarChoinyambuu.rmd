@@ -1,0 +1,269 @@
+---
+title: "ZHAW CAS Statistical Modelling - Analysis Concept"
+author: "Sansar Choinyambuu"
+---
+
+> required libraries: leaflet, leaflet.extras
+
+```{r results='TRUE', echo=FALSE, include=FALSE,}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+library(leaflet)
+library(leaflet.extras)
+require(pscl)
+library(MASS)
+library(corrplot)
+```
+
+# Problem Statement
+Having a good location is key for the restaurant’s success and profitability. Big chains like Starbucks and McDonalds have been deploying data-based location scouting for years. Smaller restaurants in contrast, unfortunately do not have resources to conduct such analysis. Is it possible to choose a best-possible location for a new restaurant based on characteristics of all locations in certain area? Location can be characterised with publicly available data such as Open Street Maps or TripAdvisor.
+
+# Approach
+Predict number of successful restaurants in a given location based on location characteristics. Rank all locations in a given area whereby locations with highest difference between predicted vs actual number of successful restaurants appear first. In other words we are going to look at the outliers of the model. If I would like to open a restaurant in a given area, I will consider this ranking to choose my location from.
+
+# Data
+Data used in this project were crawled from following sources:
+
+ + [Open Street Map](https://www.openstreetmap.org/) provides community sourced POI (Point of Interest) data
+ + [TripAdvisor](http://api.tripadvisor.com) provides metadata such as location, reviews, ratings etc. on restaurants, accomodations and attractions 
+ 
+## Data extraction
+
+ + Complete OpenStreetMaps data for Zurich city was downloaded in .pbf format (OSM Protocolbuffer Binary Format) from [Geometa lab HSR](osmaxx.hsr.ch). In order to facilitate easy analysis of location data the data was converted to .geojson format with [osmtogeojson](https://www.npmjs.com/package/osmtogeojson) tool available from npm.
+ + [TripAdvisor API](http://api.tripadvisor.com/api/partner/2.0) was crawled to get meta information on all restaurants in Zurich
+
+The source code used for data extraction is available under [github.com/sansar-choinyambuu/location-ai](https://github.com/sansar-choinyambuu/location-ai)
+
+In this project I did the analysis for city of Zurich. The center point of the city is selected as Zurich HB with following coordinates.
+$$
+longitude=8.5402515 \\
+latitude=47.3777873
+$$
+
+The area under analysis is bounded by a 10km x 10km quadrate with Zurich HB as center point.
+
+```{r, echo=FALSE}
+zhb_long <- 8.5402515
+zhb_lat <- 47.3777873
+
+leaflet() %>%
+    addTiles() %>% 
+    addRectangles(
+    lng1=8.473985985908925, lat1=47.42274082404556,
+    lng2=8.606404417832197, lat2=47.33279518066489,
+    fillColor = "transparent"
+  ) %>%
+    setView(zhb_long, zhb_lat, 12)
+```
+
+
+The area is divided into 2500 cells that are 200x200 meters. A typical block in Wiedikon (densely populated blocks in the city) is 60-70 meters wide. I have chosen the cells to be about 3 blocks in size.
+
+From all the available POI data from open street maps, I have crawled the following characteristics for each of the 2500 cells.
+
+Variable | Open Street Map key and value | Comment
+------------ | ------------- | ----------------
+Number of motorways | highway:{motorway}
+Number of major streets | highway:{trunk, primary, secondary}
+Number of minor streets | highway:{tertiary, residential}
+Number of pedestrian streets | highway:{pedestrian, footway, living_street}
+Number of public transport stations | public_transport:{station} | trains
+Number of public transport stops | public_transport:{stop_position} | buses and trams
+Number of public buildings | building:{public}
+Number of residential buildings | building:{residential, apartments, house}
+Number of schools | amenity:{school}
+Number of universities | amenity:{univsersity, college}
+Number of parking | amenity:{parking}
+Number of hospitals | amenity:{hospital}
+Number of entertainment | amenity:{arts_centre, cinema, theatre}
+Number of leisure | leisure:{} | sports, fitness, gaming, park etc.
+Number of bars | amenity:{bar, nightclub, pub, biergarten}
+Number of shops | shop:{} | all kinds of shops
+Number of tourism | tourism:{} | attractions, hotels etc.
+
+
+Additionally, from restaurant location information available from TripAdvisor I have crawled the number of successfull restaurants for each of the 2500 cells.
+Definition of a successful restaurant: TripAdvisor rating is in the top 30th percentile. TripAdvisor rating example: [Restaurant Khujug](https://www.tripadvisor.com/Restaurant_Review-g188113-d14173469-Reviews-Restaurant_Khujug-Zurich.html) has rating 8 out of 1644 restaurants in Zurich. That makes it under top 30% percentile and makes it a successful restaurant in my analysis.
+
+
+# Explorative analysis
+After all 2500 cells in Zurich city was enriched with its characteristics we have the following data.
+
+```{r}
+# expects zurich.csv in the same folder
+locations <- read.csv("zurich.csv", header = TRUE, sep = ",")
+str(locations)
+```
+
+*longitude and latitude columns contain the geographical center of location cell*
+
+
+Let us have a look at the numerical explanatory variables to check for existence of strongly correlated variables. If that is the case, the regression fitting will probably fail due to covariance matrix not being able to get inverted.
+
+```{r}
+cor_matrix <- cor(locations[, c(-1,-2,-3, -21)])
+corrplot(cor_matrix)
+```
+Linear correlation coeefficients are high between between street_pedestrian and street_minor (0.55) and between street_pedestrian and public_transport_stops (0.48)
+
+Let us look at the distribution of numeric values:
+
+```{r}
+par(mfrow = c(2,4))
+for (i in c(3:ncol(locations))){
+  summary(locations[, i])
+  boxplot(locations[, i], main = names(locations)[i])
+  hist(locations[, i], main = names(locations)[i], breaks = 20)
+}
+```
+
+*Transform to factor variable: Zipcode is must be naturally treated as factor variable. Public transportation stations and Hospitals and can be transformed to boolean factor variable, because there is only one hospital and train station per locaion at max in Zurich*
+
+```{r}
+locations$zipcode = as.factor(locations$zipcode)
+locations$public_transport_station <- as.factor(locations$public_transport_station)
+locations$hospitals <- as.factor(locations$hospitals)
+```
+
+*All other numerical variables are pretty right skewed, but since range of all numeric variable is pretty consistent with [0,156] I will not scale them*
+
+
+
+
+Let us look at the successful restaurant distribution
+```{r}
+length(which(locations$successful_restaurants == 0))
+```
+
+```{r, fig.height=3}
+hist(locations[locations$successful_restaurants > 0,20])
+```
+
+Out of 2500 locations in city of Zurich 2238 of them have no successful restaurants.
+Let us have a look at where the locations with most succcessful restaurants are in Zurich.
+
+```{r}
+cell_side = 200
+cell_radius <- (2 * (cell_side / 2) ** 2) ** 0.5
+
+leaflet(locations[locations$successful_restaurants > 0,]) %>% addTiles() %>%
+  addCircles(lng = ~longitude, lat = ~latitude, weight = 1, radius = ~successful_restaurants * 10  ) %>%
+  addHeatmap(blur = 20, max = 0.05, radius = 8) %>%
+  setView(zhb_long, zhb_lat, 12)
+```
+
+The bigger the individual circles are higher the number of successful restaurants at given location. The heatmap shows how these locations cluster together.
+
+# Model selection
+Our target variable - number of successful restaurants in a given location takes discrete positive numeric value. Therefore a poisson regression model would be suitable. However with poisson distribution, expected value and variance must be equal. Let us check with our target variable whether this condition is satisfied: 
+
+```{r}
+lm_fit <- lm(successful_restaurants ~ ., data = locations)
+variance_e_relation <- lm(log(resid(lm_fit)^2)~log(fitted(lm_fit)))
+summary(variance_e_relation)
+```
+
+Estimated coefficient for log(fitted(lm_fit)) approximiately equals to 1.7. That means with increasing expected value the variance increases 1.7 times. Relation between expected value and variance is not linear. Therefore the condition for poisson distribution is not satisfied. 
+
+As an alternative: negative binomial distribution should be more flexible as it does not have the assumption of equidispersion. With many zeroes, a zero inflated model should fit even better. Let us fit negative binomial model with and without zero inflated models to our data.
+
+```{r}
+# Error in solve.default(as.matrix(fit$hessian)) : system is computationally singular: reciprocal condition number = 4.86317e-28
+
+#zinb <- zeroinfl(successful_restaurants ~ zipcode + streets_motorways + streets_major + streets_minor + streets_pedestrian + public_transport_station + public_transport_stops + public_buildings + residential_buildings + schools + universities + parkings + hospitals + entertainments + leisures + bars + shops + tourisms, dist = "negbin", data = locations)
+#summary(zinb)
+```
+
+Model cannot be fit due to covariance matrix of explanatory variables cannot be inverted. This is caused by linealy correlated explanatory variables. As we have seen in the exploratory analysis section, we do have three explanatory variables that have high Pearson correlation coefficients. However minor streets, pedestrian streets and public transport stops happen to be naturally linearly correlated. Therefore excluding those variables out of the model cannot be an option.
+
+Let us fit the negative binomial model:
+
+```{r}
+nb <- glm.nb(successful_restaurants ~ zipcode + streets_motorways + streets_major + streets_minor + streets_pedestrian + public_transport_station + public_transport_stops + public_buildings + residential_buildings + schools + universities + parkings + hospitals + entertainments + leisures + bars + shops + tourisms, data = locations)
+summary(nb)
+```
+
+The dispersion parameter is estimated at 1.65. We have overdispersion in the target variable and this confirms the observation that I have made earlier for checking the relation between variance and expected value of our target variable. Let us interpret the model summary again with dispersion parameter taken into account:
+
+```{r}
+summary(nb, dispersion = 1.6593)
+```
+
+
+Some zipcodes (8003,8004,8005) have significant positive influence on number of successful restaurants at a given location. This is not surprising hence, all three zipcodes are centred around the Zurich's trendy districts. In contrast to that, some zipcodes (8044, 8049) have significant negative influence on number of successful restaurants.
+
+Number of major and minor streets are also significant positive influencers on number of successful restaurants. Number of entertainments, bars, shops and tourism venues have also positive influence of number of successful restaurants at a given location.
+
+# Model test
+Let us test whether out fitted negative binomial model is better than the null model which only contains the intercept:
+
+```{r}
+pchisq(nb$null - nb$dev, df = 44, lower.tail = FALSE)
+```
+
+P value is numerically zero, therefore the null hypothesis will be rejected, model including all explanatory variables is doing significantly better job at explaining number of successful restaurants at a given location in comparison to null model.
+
+Goodness of fit can be tested by seeing whether this model is as good as the satured model with zero deviance.
+```{r}
+pchisq(756.99, 2445, lower = FALSE)
+```
+The null hypothesis of this test is that the model can explain the variance in target variable as well as saturated model with zero deviance. The p value is over 0.05, therefore null hypothesis can be rejected.
+
+
+# Variable selection
+
+Since we have some variables that not significant, let us do some variable selection. We use F test instead of chisq test, due to overdispersion in the model.
+
+```{r}
+step(nb, test="F")
+```
+
+The best model according to AIC score has the following explanatory variables only:
+ + zipcode
+ + streets_major
+ + streets_minor 
+ + public_transport_stops 
+ + parkings 
+ + entertainments 
+ + bars 
+ + shops 
+ + tourisms
+
+# Prediction
+
+As explained in the approach section, I would like to find those locations for which the model suggest the higher amount of successful restaurants. I will take the full model for the predictions.
+
+```{r}
+df = data.frame(long = locations$longitude, lat = locations$latitude, actual = locations$successful_restaurants, predicted = nb$fitted.values)
+df$diff = df$predicted - df$actual
+head(df[order(df$diff, decreasing = TRUE),], 50)
+```
+
+Let us filter the 49 locations where our model predicts at least one additional successful restaurant, compared to actual data:
+```{r}
+filtered <- df[df$diff > 1,]
+```
+
+When visualized on map, the most promosing 49 locations for a new restaurant in Zurich are:
+
+```{r}
+leaflet(df[df$diff > 1,]) %>% addTiles() %>%
+  addCircles(weight = 1, radius = ~diff * 10  ) %>%
+  addHeatmap(blur = 20, max = 0.05, radius = 10) %>%
+  setView(zhb_long, zhb_lat, 13)
+```
+
+The bigger the individual circles are higher the difference between model predicted successful restaurants and actual successful restaurants at that location. The heatmap shows how these locations cluster together.
+
+
+# Outlook
+Number of possible improvements and alternative approaches can be considered in the future:
+
+Improvements:
+
+ + Goodness of fit test for the negative binomal model has failed. Therefore this model is not as good job as satured model with zero deviance. Number of successful restaurants are probably influenced by other factors that are not considered in this model.
+ + Since the majority of the locations have zero successful restaurants, zero inflated models would probably suit better. Some work needs to be done towards eliminating the linear correlation between explanatory variables so that covariance matrix can be inverted.
+ + Due to the fact that the unit location has been selected as 200x200 meters cell, the model can predict high amount of restaurants for locations that have other good restaurants just outside of the cell border.
+ +  The competition aspects were not considered in the model. The number of existing competitions have presumably some effect on the success of the restaurant. When considering for new location maybe we should take the locations with lowest number of existing successful restaurants
+
+ 
+As an alternative approach, we can cluster the locations and observe how the locations with many successful restaurants are clustered. If those locations are mainly clustered together, the candidate for best new location might be in that cluster.
